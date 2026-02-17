@@ -4,140 +4,149 @@ import re
 import os
 
 # --- CONFIGURATION ---
-# Ensure this file is uploaded to your GitHub repository alongside this script
+# IMPORTANT: This filename must match exactly what is in your GitHub Repo
 DEFAULT_MASTER_FILE = "Insurance_Creation_Master_New-Version.csv"
 
-# --- CORE PROCESSING LOGIC ---
+# --- CORE LOGIC ---
 
 def normalize(val):
-    """Removes all non-alphanumeric characters and converts to lowercase for fuzzy matching."""
+    """Removes non-alphanumeric chars and converts to lowercase."""
     if pd.isna(val): return ""
     return re.sub(r'[^a-zA-Z0-9]', '', str(val)).lower()
 
 def standardize_id(val):
-    """Pads numeric IDs to 5 digits and handles suffixes (e.g., 37077-NOCD)."""
+    """Aggressively pads numeric IDs to 5 digits and removes decimals/suffixes."""
     if pd.isna(val) or str(val).strip() == '': return ""
-    # Standardize by splitting at hyphens and taking the base ID
-    val_str = str(val).strip().split('-')[0]
-    return val_str.zfill(5) if val_str.isdigit() and len(val_str) < 5 else val_str
+    # Handle "1111.0" or "37077-NOCD"
+    val_str = str(val).split('.')[0].strip().split('-')[0]
+    # Pad with zeros if it's a number less than 5 digits
+    if val_str.isdigit() and len(val_str) < 5:
+        return val_str.zfill(5)
+    return val_str
 
 @st.cache_data
 def load_lookup_data(file_source):
-    """Loads master data and builds tiered lookup dictionaries."""
+    # Load Master with 'latin1' to handle special chars
     df = pd.read_csv(file_source, dtype=str, encoding='latin1').fillna('')
     
-    # Tiered Lookup Dictionaries
-    lookups = {
-        "full": {},     # (ID, Name, CH)
-        "id_name": {},  # (ID, Name)
-        "name_ch": {},  # (Name, CH)
-        "id_ch": {},    # (ID, CH)
-        "id_only": {},  # ID
-        "name_only": {} # Name
-    }
+    id_map = {}
+    name_map = {}
+    master_names_list = [] # For partial matching
 
     for _, row in df.iterrows():
         pid = standardize_id(row.get('Payer ID', ''))
-        pname = normalize(row.get('Clean_payer Name') if row.get('Clean_payer Name') else row.get('Payer Name', ''))
-        ch = str(row.get('Source_File', '')).strip().upper()
+        # Get cleanest name available
+        raw_name = row.get('Clean_payer Name') if row.get('Clean_payer Name') else row.get('Payer Name', '')
+        pname = normalize(raw_name)
+        
         data = row.to_dict()
-
-        # Build Lookups
-        if pid and pname and ch: lookups["full"].setdefault((pid, pname, ch), data)
-        if pid and pname: lookups["id_name"].setdefault((pid, pname), data)
-        if pname and ch: lookups["name_ch"].setdefault((pname, ch), data)
-        if pid and ch: lookups["id_ch"].setdefault((pid, ch), data)
-        if pid: lookups["id_only"].setdefault(pid, data)
-        if pname: lookups["name_only"].setdefault(pname, data)
+        
+        if pid: id_map[pid] = data
+        if pname: 
+            name_map[pname] = data
+            master_names_list.append((pname, data))
             
-    return df, lookups
+    return df, id_map, name_map, master_names_list
 
 # --- STREAMLIT UI ---
 
-st.set_page_config(page_title="Scrubber Pro", layout="wide")
-st.title("🛡️ Scrubber Pro: Cloud Edition")
+st.set_page_config(page_title="Scrubber Pro v2", layout="wide")
+st.title("🛡️ Scrubber Pro: Intelligent Mapper")
 
-# Check for Master File in the repository
+# Check for Master File in Repo
 if os.path.exists(DEFAULT_MASTER_FILE):
-    m_df, m_lookups = load_lookup_data(DEFAULT_MASTER_FILE)
-    st.sidebar.success(f"✅ Master Sheet Pre-loaded ({len(m_df)} records)")
+    m_df, m_id, m_name, m_name_list = load_lookup_data(DEFAULT_MASTER_FILE)
+    st.sidebar.success(f"✅ Master DB Loaded from Repo: {len(m_df)} records")
 else:
-    st.sidebar.error("⚠️ Master Sheet not found in repository.")
-    manual_master = st.sidebar.file_uploader("Upload Master Payer List (CSV)", type=['csv'])
-    if manual_master:
-        m_df, m_lookups = load_lookup_data(manual_master)
-        st.sidebar.success("✅ Manual Master Sheet Loaded")
-    else:
-        st.info("Please ensure 'Insurance_Master_Final_Naming_Updated.csv' is in your GitHub repo.")
-        st.stop()
+    st.error(f"❌ Could not find '{DEFAULT_MASTER_FILE}' in the repository. Please check the filename.")
+    st.stop()
 
-# File Upload Section for target claims
-st.subheader("Step 1: Upload Claims or Payer Files")
-target_files = st.file_uploader("Drop your files here", type=['csv', 'xlsx'], accept_multiple_files=True)
+# File Upload
+st.subheader("Step 1: Upload Data to Scrub")
+target_files = st.file_uploader("Upload CSV or Excel", type=['csv', 'xlsx'], accept_multiple_files=True)
 
 if target_files:
-    for target_file in target_files:
-        # Load the uploaded target file
-        if target_file.name.endswith('.csv'):
-            t_df = pd.read_csv(target_file, dtype=str, encoding='latin1').fillna('')
+    for t_file in target_files:
+        # Load File (Explicit engine='openpyxl' for Excel to prevent ImportError)
+        if t_file.name.endswith('.csv'):
+            t_df = pd.read_csv(t_file, dtype=str, encoding='latin1').fillna('')
         else:
-            t_df = pd.read_excel(target_file, dtype=str).fillna('')
-        
-        if st.button(f"🚀 Process {target_file.name}"):
-            with st.spinner(f"Scrubbing {target_file.name}..."):
+            t_df = pd.read_excel(t_file, dtype=str, engine='openpyxl').fillna('')
+
+        if st.button(f"🚀 Scrub {t_file.name}"):
+            with st.spinner("Analyzing aliases and partial matches..."):
                 results = []
-                # Find Clearinghouse column
-                ch_col = next((c for c in ['Clearinghouse ID', 'CH Names', 'Source_File'] if c in t_df.columns), None)
-
+                
+                # Auto-detect any column that might contain names (Payer Name, Known Names, etc.)
+                name_cols = [c for c in t_df.columns if 'NAME' in c.upper()]
+                
                 for _, row in t_df.iterrows():
-                    pid = standardize_id(row.get('Payer ID', ''))
-                    pname = normalize(row.get('Payer Name', ''))
-                    ch = str(row.get(ch_col, '')).strip().upper() if ch_col else ""
+                    # 1. Prepare Target ID
+                    t_id = standardize_id(row.get('Payer ID', ''))
                     
-                    match, method = None, "No Match"
+                    # 2. Prepare Target Names (Split commas!)
+                    potential_names = []
+                    for col in name_cols:
+                        raw_val = str(row.get(col, ''))
+                        # Split by comma to handle "MEDICAID TEXAS, MEDICAID OF TEXAS"
+                        parts = [normalize(x) for x in raw_val.split(',')]
+                        potential_names.extend(parts)
+                    
+                    # Remove empty strings and duplicates
+                    potential_names = list(set(filter(None, potential_names)))
 
-                    # --- TIERED SEARCH HIERARCHY ---
-                    # Tier 1: Triple Match
-                    if (pid, pname, ch) in m_lookups["full"]:
-                        match, method = m_lookups["full"][(pid, pname, ch)], "Tier 1: ID+Name+CH"
-                    
-                    # Tier 2: Double Matches
-                    elif (pid, pname) in m_lookups["id_name"]:
-                        match, method = m_lookups["id_name"][(pid, pname)], "Tier 2: ID+Name"
-                    elif (pname, ch) in m_lookups["name_ch"]:
-                        match, method = m_lookups["name_ch"][(pname, ch)], "Tier 2: Name+CH"
-                    elif (pid, ch) in m_lookups["id_ch"]:
-                        match, method = m_lookups["id_ch"][(pid, ch)], "Tier 2: ID+CH"
-                    
-                    # Tier 3: Single Factor Matches
-                    elif pid in m_lookups["id_only"]:
-                        match, method = m_lookups["id_only"][pid], "Tier 3: ID Only"
-                    elif pname in m_lookups["name_only"]:
-                        match, method = m_lookups["name_only"][pname], "Tier 3: Name Only"
+                    match_data = None
+                    method = "Unresolved"
 
-                    if match:
-                        # Map missing columns from Master to the row
+                    # --- MATCHING LOGIC ---
+                    
+                    # Tier 1: Exact ID Match
+                    if t_id in m_id:
+                        match_data = m_id[t_id]
+                        method = "ID Match"
+                    
+                    # Tier 2: Exact Name Match (Check every alias in the cell)
+                    if not match_data:
+                        for name in potential_names:
+                            if name in m_name:
+                                match_data = m_name[name]
+                                method = f"Exact Name: {name}"
+                                break
+                    
+                    # Tier 3: Partial Name Match (Target inside Master or Master inside Target)
+                    if not match_data and potential_names:
+                        for name in potential_names:
+                            if len(name) < 4: continue # Skip short noise like "HMO"
+                            
+                            for m_n, m_d in m_name_list:
+                                # Target "Triwest" is in Master "Triwest Healthcare"
+                                if name in m_n: 
+                                    match_data = m_d
+                                    method = f"Partial: '{name}' in Master"
+                                    break
+                                # Master "Cigna" is in Target "Cigna Medicare"
+                                if m_n in name:
+                                    match_data = m_d
+                                    method = f"Partial: Master in '{name}'"
+                                    break
+                            if match_data: break
+
+                    # --- RESULT ASSIGNMENT ---
+                    if match_data:
                         for col in m_df.columns:
                             if col not in t_df.columns:
-                                row[col] = match[col]
+                                row[col] = match_data[col]
                         row['Payer Std?'] = 'Yes'
-                        row['Search Method'] = method
                     else:
                         row['Payer Std?'] = 'No'
-                        row['Search Method'] = 'Unresolved'
                     
+                    row['Search Method'] = method
                     results.append(row)
 
-                processed_df = pd.DataFrame(results)
+                # Output
+                final_df = pd.DataFrame(results)
+                st.write(f"### Results for {t_file.name}")
+                st.dataframe(final_df.head(50))
                 
-                # Display and Download
-                st.write(f"### Results for {target_file.name}")
-                st.dataframe(processed_df.head(20))
-                
-                csv_data = processed_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label=f"📥 Download Scrubbed_{target_file.name}",
-                    data=csv_data,
-                    file_name=f"Scrubbed_{target_file.name}",
-                    mime="text/csv"
-                )
+                csv = final_df.to_csv(index=False).encode('utf-8')
+                st.download_button(f"📥 Download Result", csv, f"Mapped_{t_file.name}", "text/csv")
